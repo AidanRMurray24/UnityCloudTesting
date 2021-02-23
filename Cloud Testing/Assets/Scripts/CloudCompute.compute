@@ -1,0 +1,122 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+Texture2D<float4> Source;
+SamplerState samplerSource;
+RWTexture2D<float4> Result;
+SamplerState samplerResult;
+Texture2D<float4> _DepthTexture;
+
+float4x4 invViewMatrix, invProjectionMatrix;
+float3 cameraPos;
+
+float3 containerBoundsMin;
+float3 containerBoundsMax;
+
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+float3 GetViewVector(float2 uv)
+{
+    float3 viewVector = mul(invProjectionMatrix, float4(uv, 0, 1)).xyz;
+    viewVector = mul(invViewMatrix, float4(viewVector, 0)).xyz;
+    return viewVector;
+}
+
+Ray CreateRay(float3 origin, float3 direction) {
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv) {
+    float3 origin = mul(invViewMatrix, float4(0, 0, 0, 1)).xyz;
+    float3 direction = GetViewVector(uv);
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+// Returns (dstToBox, dstInsideBox). If ray misses box, dstInsideBox will be zero
+float2 RayBoxDst(float3 boundsMin, float3 boundsMax, float3 rayOrigin, float3 invRaydir) {
+    // Adapted from: http://jcgt.org/published/0007/03/04/
+    float3 t0 = (boundsMin - rayOrigin) * invRaydir;
+    float3 t1 = (boundsMax - rayOrigin) * invRaydir;
+    float3 tmin = min(t0, t1);
+    float3 tmax = max(t0, t1);
+
+    float dstA = max(max(tmin.x, tmin.y), tmin.z);
+    float dstB = min(tmax.x, min(tmax.y, tmax.z));
+
+    // CASE 1: ray intersects box from outside (0 <= dstA <= dstB)
+    // dstA is dst to nearest intersection, dstB dst to far intersection
+
+    // CASE 2: ray intersects box from inside (dstA < 0 < dstB)
+    // dstA is the dst to intersection behind the ray, dstB is dst to forward intersection
+
+    // CASE 3: ray misses box (dstA > dstB)
+
+    float dstToBox = max(0, dstA);
+    float dstInsideBox = max(0, dstB - dstToBox);
+    return float2(dstToBox, dstInsideBox);
+}
+
+float LinearEyeDepth(float z)
+{
+    //z = 1 - z;
+    float near = 0.1f;
+    float far = 1000.f;
+    float4 _ZBufferParams = 0;
+    _ZBufferParams.x = -1 + far / (float)near;
+    _ZBufferParams.y = 1;
+    _ZBufferParams.z = _ZBufferParams.x / (float)far;
+    _ZBufferParams.w = 1 / (float)far;
+
+    return (float)1.0f / (_ZBufferParams.z * z + _ZBufferParams.w);
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    // Get the UVs of the screen
+    uint2 resolution;
+    Result.GetDimensions(resolution.x, resolution.y);
+    float2 uv = id.xy / float2(resolution) * 2 - 1;
+
+    // Set the colour to the source render texture initially
+    float4 col = Source[id.xy];
+    Result[id.xy] = col;
+
+    // Calculate the ray origin and direction
+    Ray cameraRay = CreateCameraRay(uv);
+    float3 ro = cameraRay.origin;
+    float3 rd = cameraRay.direction;
+
+    // Get the ray distance information from the box
+    float2 rayBoxInfo = RayBoxDst(containerBoundsMin.xyz, containerBoundsMax.xyz, ro, 1 / rd);
+    float dstToBox = rayBoxInfo.x;
+    float dstInsideBox = rayBoxInfo.y;
+
+    // Sample the depth map to determine the depth of the container
+    /*float nonlin_depth = SAMPLE_DEPTH_TEXTURE(_CameraDepthTexture, i.uv);
+    float depth = LinearEyeDepth(nonlin_depth) * viewLength;*/
+
+    float3 viewVector = GetViewVector(uv);
+    float nonlin_depth = _DepthTexture[id.xy].x;
+    float depth = LinearEyeDepth(nonlin_depth) * length(viewVector);
+
+    // Only shade black if inside the box
+    bool rayHitBox = dstInsideBox > 0 && dstToBox < depth;
+    if (rayHitBox)
+    {
+        col = 0;
+    }
+
+    Result[id.xy] = col;
+    //Result[id.xy] = float4(uv,0,0);
+    //Result[id.xy] = float4(depth, depth, depth, 0);
+}
